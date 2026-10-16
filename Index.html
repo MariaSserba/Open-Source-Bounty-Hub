@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract OpenSourceBountyHub {
+    enum BountyStatus { Open, Assigned, Resolved, Canceled }
+
+    struct Bounty {
+        address payable creator;
+        address payable solver;
+        uint256 rewardWei;
+        BountyStatus status;
+        bytes32 repositoryHash;
+    }
+
+    address payable public immutable hubAdmin;
+    string public hubDescriptor;
+    uint256 public hubFeeBps; // 200 = 2%
+    uint256 public bountyCounter;
+    uint256 public accumulatedFees;
+    bool public isHubPaused;
+
+    mapping(bytes32 => bool) public approvedRepositories;
+    mapping(uint256 => Bounty) public bounties;
+
+    event RepositoryApproved(bytes32 indexed repoHash);
+    event BountyFunded(uint256 indexed bountyId, address indexed creator, uint256 reward);
+    event BountyAccepted(uint256 indexed bountyId, address indexed solver);
+    event BountyResolved(uint256 indexed bountyId);
+    event RewardClaimed(uint256 indexed bountyId, address indexed solver, uint256 amount);
+    event BountyCanceled(uint256 indexed bountyId, uint256 refundedAmount);
+    event TreasuryDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event HubPauseToggled(bool isPaused);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == hubAdmin, "OSBounty: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isHubPaused, "OSBounty: Hub is paused");
+        _;
+    }
+
+    constructor() {
+        hubAdmin = payable(msg.sender);
+        hubDescriptor = "Open Source Bounty Hub Core v1";
+        hubFeeBps = 200; // 2%
+        isHubPaused = false;
+        approvedRepositories[0x4749544855425f4f50454e534f555243455f434f524500000000000000000000] = true;
+    }
+
+    // 1. acceptBountyTask
+    function acceptBountyTask(uint256 bountyId) external whenNotPaused {
+        Bounty storage b = bounties[bountyId];
+        require(bountyId > 0 && bountyId <= bountyCounter, "OSBounty: Invalid ID");
+        require(b.status == BountyStatus.Open, "OSBounty: Not open");
+
+        b.solver = payable(msg.sender);
+        b.status = BountyStatus.Assigned;
+        emit BountyAccepted(bountyId, msg.sender);
+    }
+
+    // 2. addApprovedRepository
+    function addApprovedRepository(bytes32 repoHash) external onlyAdmin {
+        require(!approvedRepositories[repoHash], "OSBounty: Already approved");
+        approvedRepositories[repoHash] = true;
+        emit RepositoryApproved(repoHash);
+    }
+
+    // 3. cancelBountyOffer
+    function cancelBountyOffer(uint256 bountyId) external {
+        Bounty storage b = bounties[bountyId];
+        require(bountyId > 0 && bountyId <= bountyCounter, "OSBounty: Invalid ID");
+        require(msg.sender == b.creator || msg.sender == hubAdmin, "OSBounty: Unauthorized");
+        require(b.status == BountyStatus.Open || b.status == BountyStatus.Assigned, "OSBounty: Cannot cancel");
+
+        b.status = BountyStatus.Canceled;
+        uint256 refund = b.rewardWei;
+        b.rewardWei = 0;
+
+        if (refund > 0) {
+            (bool sent, ) = b.creator.call{value: refund}("");
+            require(sent, "OSBounty: Refund failed");
+        }
+
+        emit BountyCanceled(bountyId, refund);
+    }
+
+    // 4. claimBountyReward
+    function claimBountyReward(uint256 bountyId) external {
+        Bounty storage b = bounties[bountyId];
+        require(bountyId > 0 && bountyId <= bountyCounter, "OSBounty: Invalid ID");
+        require(msg.sender == b.solver, "OSBounty: Not the solver");
+        require(b.status == BountyStatus.Resolved, "OSBounty: Not resolved yet");
+        require(b.rewardWei > 0, "OSBounty: No reward available");
+
+        uint256 payout = b.rewardWei;
+        b.rewardWei = 0;
+
+        (bool sent, ) = b.solver.call{value: payout}("");
+        require(sent, "OSBounty: Payout failed");
+
+        emit RewardClaimed(bountyId, msg.sender, payout);
+    }
+
+    // 5. drainHubTreasury
+    function drainHubTreasury() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "OSBounty: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: balance}("");
+        require(sent, "OSBounty: Sweep failed");
+
+        emit TreasuryDrained(hubAdmin, balance);
+    }
+
+    // 6. fundBountyOffer
+    function fundBountyOffer(bytes32 repoHash) external payable whenNotPaused returns (uint256) {
+        require(approvedRepositories[repoHash], "OSBounty: Unapproved repository");
+        require(msg.value > 0, "OSBounty: Zero funding");
+
+        uint256 fee = (msg.value * hubFeeBps) / 10000;
+        uint256 netReward = msg.value - fee;
+        accumulatedFees += fee;
+
+        bountyCounter++;
+        bounties[bountyCounter] = Bounty({
+            creator: payable(msg.sender),
+            solver: payable(address(0)),
+            rewardWei: netReward,
+            status: BountyStatus.Open,
+            repositoryHash: repoHash
+        });
+
+        emit BountyFunded(bountyCounter, msg.sender, netReward);
+        return bountyCounter;
+    }
+
+    // 7. harvestHubFees
+    function harvestHubFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "OSBounty: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: amount}("");
+        require(sent, "OSBounty: Harvest failed");
+
+        emit FeesHarvested(hubAdmin, amount);
+    }
+
+    // 8. pauseBountyHub
+    function pauseBountyHub(bool isPaused) external onlyAdmin {
+        isHubPaused = isPaused;
+        emit HubPauseToggled(isPaused);
+    }
+
+    // 9. resolveBountyTask
+    function resolveBountyTask(uint256 bountyId) external {
+        Bounty storage b = bounties[bountyId];
+        require(bountyId > 0 && bountyId <= bountyCounter, "OSBounty: Invalid ID");
+        require(msg.sender == b.creator || msg.sender == hubAdmin, "OSBounty: Unauthorized");
+        require(b.status == BountyStatus.Assigned, "OSBounty: Not assigned");
+
+        b.status = BountyStatus.Resolved;
+        emit BountyResolved(bountyId);
+    }
+
+    // 10. updateHubDescriptor
+    function updateHubDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "OSBounty: Empty string");
+        hubDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getBountyInfo(uint256 bountyId) external view returns (
+        address creator,
+        address solver,
+        uint256 rewardWei,
+        BountyStatus status,
+        bytes32 repoHash
+    ) {
+        Bounty memory b = bounties[bountyId];
+        return (b.creator, b.solver, b.rewardWei, b.status, b.repositoryHash);
+    }
+}
